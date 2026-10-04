@@ -10,22 +10,53 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
+import os
 from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
+
+
+def env_bool(value, default=False):
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_list(value, default=""):
+    raw = value if value is not None else default
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
+IS_DEVELOPMENT = ENVIRONMENT in {"development", "dev"}
+IS_PRODUCTION = not IS_DEVELOPMENT
+DEBUG = env_bool(os.getenv("DEBUG"), IS_DEVELOPMENT)
+
+if IS_PRODUCTION and DEBUG:
+    raise ImproperlyConfigured("DEBUG must be false outside development.")
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-f-*q!g-eil01oqahyv-8ca%h0tiwg1(z9=0w&xv5(tyxy8mim5'
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
+if not SECRET_KEY:
+    if not DEBUG:
+        raise ImproperlyConfigured("DJANGO_SECRET_KEY is required when DEBUG is false.")
+    SECRET_KEY = "django-insecure-local-development-only"
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
-
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = env_list(
+    os.getenv("ALLOWED_HOSTS"),
+    "localhost,127.0.0.1,testserver" if DEBUG else "",
+)
+FRONTEND_HOSTNAME = os.getenv("FRONTEND_HOSTNAME", "").strip()
+if FRONTEND_HOSTNAME and FRONTEND_HOSTNAME not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(FRONTEND_HOSTNAME)
+if not DEBUG and not ALLOWED_HOSTS:
+    raise ImproperlyConfigured("ALLOWED_HOSTS must be configured when DEBUG is false.")
 
 
 # Application definition
@@ -37,10 +68,25 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+
+    'rest_framework',
+    'corsheaders',
+    'channels',
+    'realtime',
+
+    'user_accounts',
+    'restaurants',
+    'menu',
+    'orders',
+    'billing',
+    'inventory',
+    'analytics',
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -67,17 +113,70 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'config.wsgi.application'
+ASGI_APPLICATION = 'config.routing.application'
+
+CHANNEL_LAYERS = {
+    "default": (
+        {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {"hosts": [os.environ["REDIS_URL"]]},
+        }
+        if os.getenv("REDIS_URL")
+        else {"BACKEND": "channels.layers.InMemoryChannelLayer"}
+    ),
+}
+REDIS_URL = os.getenv("REDIS_URL")
+if not DEBUG and not REDIS_URL:
+    raise ImproperlyConfigured("REDIS_URL is required in production for shared channels and throttling.")
+
+CACHES = {
+    "default": (
+        {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+            "KEY_PREFIX": "restaurant-saas",
+        }
+        if REDIS_URL
+        else {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}
+    ),
+}
 
 
 # Database
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-    }
+database_settings = {
+    "ENGINE": os.getenv("DB_ENGINE", "django.db.backends.postgresql"),
+    "NAME": os.getenv("DB_NAME", "restaurant_saas" if DEBUG else ""),
+    "USER": os.getenv("DB_USER", "postgres" if DEBUG else ""),
+    "PASSWORD": os.getenv("DB_PASSWORD", ""),
+    "HOST": os.getenv("DB_HOST", "localhost" if DEBUG else ""),
+    "PORT": os.getenv("DB_PORT", "5432"),
+    "CONN_MAX_AGE": int(os.getenv("DB_CONN_MAX_AGE", "0" if DEBUG else "60")),
+    "CONN_HEALTH_CHECKS": True,
 }
+if not DEBUG:
+    if not database_settings["ENGINE"].endswith("postgresql"):
+        raise ImproperlyConfigured("Production requires a PostgreSQL database backend.")
+    missing_database_settings = [
+        name for name in ("NAME", "USER", "PASSWORD", "HOST")
+        if not database_settings[name]
+    ]
+    if missing_database_settings:
+        raise ImproperlyConfigured(
+            "Database settings required when DEBUG is false: "
+            + ", ".join(missing_database_settings)
+        )
+database_options = {}
+if database_settings["ENGINE"].endswith("postgresql"):
+    database_options["connect_timeout"] = 3
+database_sslmode = os.getenv("DB_SSLMODE", "require" if not DEBUG else "")
+if database_sslmode:
+    database_options["sslmode"] = database_sslmode
+if database_options:
+    database_settings["OPTIONS"] = database_options
+
+DATABASES = {"default": database_settings}
 
 
 # Password validation
@@ -115,13 +214,106 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / "staticfiles"
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
 
 
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
-MAILERS = {
-    'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+EMAIL_BACKEND = os.getenv(
+    "EMAIL_BACKEND",
+    "django.core.mail.backends.console.EmailBackend" if DEBUG else "django.core.mail.backends.smtp.EmailBackend",
+)
+EMAIL_HOST = os.getenv("EMAIL_HOST", "")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
+EMAIL_USE_TLS = env_bool(os.getenv("EMAIL_USE_TLS"), not DEBUG)
+EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "no-reply@example.invalid")
+
+CORS_ALLOWED_ORIGINS = env_list(
+    os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173" if DEBUG else "",
+    ),
+)
+if "*" in CORS_ALLOWED_ORIGINS:
+    raise ImproperlyConfigured("CORS_ALLOWED_ORIGINS must contain explicit origins, not '*'.")
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOW_CREDENTIALS = False
+CSRF_TRUSTED_ORIGINS = env_list(
+    os.getenv(
+        "CSRF_TRUSTED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173" if DEBUG else "",
+    ),
+)
+
+SECURE_SSL_REDIRECT = env_bool(os.getenv("SECURE_SSL_REDIRECT"), not DEBUG)
+SECURE_HSTS_SECONDS = int(os.getenv("SECURE_HSTS_SECONDS", "0" if DEBUG else "3600"))
+SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool(os.getenv("SECURE_HSTS_INCLUDE_SUBDOMAINS"), False)
+SECURE_HSTS_PRELOAD = env_bool(os.getenv("SECURE_HSTS_PRELOAD"), False)
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+SECURE_CROSS_ORIGIN_OPENER_POLICY = "same-origin"
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
+X_FRAME_OPTIONS = "DENY"
+if env_bool(os.getenv("TRUST_PROXY_SSL_HEADER"), False):
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
+
+AUTH_USER_MODEL = "user_accounts.User"
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": (
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ),
+    "DEFAULT_PERMISSION_CLASSES": (
+        "rest_framework.permissions.IsAuthenticated",
+    ),
+    "DEFAULT_THROTTLE_CLASSES": (
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
+    ),
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": os.getenv("API_ANON_RATE", "100/minute"),
+        "user": os.getenv("API_USER_RATE", "1000/hour"),
+        "auth_login": os.getenv("API_AUTH_LOGIN_RATE", "10/minute"),
+    },
+    "NUM_PROXIES": int(os.getenv("API_NUM_PROXIES", "0")),
+}
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO" if not DEBUG else "WARNING").upper()
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "standard": {
+            "format": "{levelname} {asctime} {name} {message}",
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "standard",
+        },
+    },
+    "root": {"handlers": ["console"], "level": LOG_LEVEL},
+    "loggers": {
+        "django": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
+        "django.request": {"handlers": ["console"], "level": "ERROR", "propagate": False},
     },
 }
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
